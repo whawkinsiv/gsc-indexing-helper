@@ -7,3 +7,6 @@
 
 # Packaging output
 *.zip
+
+# Node
+node_modules/

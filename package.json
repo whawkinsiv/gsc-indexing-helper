@@ -1,0 +1,16 @@
+{
+  "name": "gsc-indexing-helper",
+  "version": "0.4.0",
+  "private": true,
+  "description": "Chrome extension that processes URLs from Google Search Console's not-indexed reports.",
+  "scripts": {
+    "test": "node --test tests/",
+    "lint": "eslint .",
+    "check": "npm run lint && npm test"
+  },
+  "devDependencies": {
+    "eslint": "^9.18.0",
+    "globals": "^15.14.0",
+    "jsdom": "^29.1.1"
+  }
+}
