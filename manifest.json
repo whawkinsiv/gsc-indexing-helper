@@ -1,0 +1,16 @@
+{
+  "manifest_version": 3,
+  "name": "GSC Indexing Helper",
+  "version": "0.3.0",
+  "description": "Process URLs from Google Search Console's Crawled or Discovered - currently not indexed reports.",
+  "permissions": ["storage", "unlimitedStorage"],
+  "host_permissions": ["https://search.google.com/search-console/*"],
+  "content_scripts": [
+    {
+      "matches": ["https://search.google.com/search-console/*"],
+      "css": ["styles.css"],
+      "js": ["content.js"],
+      "run_at": "document_idle"
+    }
+  ]
+}

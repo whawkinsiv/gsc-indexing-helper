@@ -1,0 +1,8 @@
+#gsc-indexing-helper-host {
+  all: initial;
+  position: fixed;
+  right: 18px;
+  bottom: 18px;
+  z-index: 2147483647;
+  color-scheme: light;
+}
