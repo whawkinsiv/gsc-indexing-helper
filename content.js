@@ -1,101 +1,179 @@
+/**
+ * GSC Indexing Helper - content script.
+ *
+ * The script adds a panel to Google Search Console. The panel processes URLs
+ * from the "Crawled" and "Discovered - currently not indexed" reports.
+ *
+ * lib.js loads first and supplies the pure rules in `GSC_LIB`.
+ */
 (() => {
   "use strict";
 
   if (window.__gscIndexingHelperLoaded) return;
   window.__gscIndexingHelperLoaded = true;
 
-  const STORAGE_KEY = "gscIndexingHelperStateV1";
-  const BATCH_LIMIT = 10;
-  const RETRY_AFTER_DAYS = 14;
-  const REPORT_NAMES = [
-    "Crawled - currently not indexed",
-    "Discovered - currently not indexed"
-  ];
-  const POLL_MS = 750;
+  const L = globalThis.GSC_LIB;
+  if (!L) {
+    console.error("GSC Indexing Helper: lib.js did not load.");
+    return;
+  }
 
-  const DEFAULT_STATE = {
+  const {
+    BATCH_LIMIT,
+    RETRY_AFTER_DAYS,
+    FAILED_RETRY_AFTER_DAYS,
+    MAX_CONSECUTIVE_FAILURES,
+    MAX_RUNS,
+    REPORT_NAMES,
+    normalize,
+    lower,
+    escapeHtml
+  } = L;
+
+  // Storage keys. The live state, the attempt history, and each run are
+  // separate. A write during a batch therefore touches one small record
+  // instead of the complete log.
+  const CORE_KEY = "gscIndexingHelperCoreV2";
+  const HISTORY_KEY = "gscIndexingHelperHistoryV2";
+  const RUN_KEY_PREFIX = "gscIndexingHelperRunV2:";
+  const LEGACY_KEY = "gscIndexingHelperStateV1";
+
+  const POLL_MS = 750;
+  const PAGE_TEXT_TTL_MS = 250;
+  const URL_COUNT_TTL_MS = 5000;
+  const RENDER_DEBOUNCE_MS = 1000;
+  const DISPLAYED_RUNS = 5;
+
+  const DEFAULT_CORE = {
     running: false,
     paused: false,
     queue: [],
     activeUrl: null,
-    completedThisRun: 0,
     checkedThisRun: 0,
     requestsThisRun: 0,
+    skippedThisRun: 0,
+    consecutiveFailures: 0,
     runLimit: BATCH_LIMIT,
     startedAt: null,
     reportUrl: null,
     activeRunId: null,
-    history: {},
     log: [],
-    runs: []
+    runIndex: []
   };
 
-  let state = { ...DEFAULT_STATE };
+  /** The live state. This record stays small and is written often. */
+  let state = { ...DEFAULT_CORE };
+
+  /** URL -> { status, at, message }. Written once per finished URL. */
+  let history = {};
+
+  /** Run id -> items array. Held in memory for the runs the panel shows. */
+  const runItems = new Map();
+
+  /** Run ids the user expanded in the panel. */
+  const openRunIds = new Set();
+
   let workerPromise = null;
   let ui = null;
+  let lastPanelHtml = "";
+  let storageError = null;
+  let renderTimer = null;
 
   const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
-  const normalize = (value) => (value || "")
-    .replace(/[\u2010-\u2015\u2212]/g, "-")
-    .replace(/\s+/g, " ")
-    .trim();
-  const lower = (value) => normalize(value).toLowerCase();
 
-  function visible(element) {
-    if (!(element instanceof Element)) return false;
-    const style = getComputedStyle(element);
-    const rect = element.getBoundingClientRect();
-    return style.display !== "none" && style.visibility !== "hidden" && rect.width > 0 && rect.height > 0;
-  }
+  // ---------------------------------------------------------------------------
+  // Storage
+  // ---------------------------------------------------------------------------
 
-  function validPublicUrl(value) {
-    try {
-      const url = new URL(value);
-      return (url.protocol === "http:" || url.protocol === "https:") &&
-        url.hostname !== "search.google.com";
-    } catch {
-      return false;
-    }
-  }
-
-  function urlsFromText(text) {
-    const matches = (text || "").match(/https?:\/\/[^\s<>"']+/g) || [];
-    return matches
-      .map((candidate) => candidate.replace(/[),.;\]]+$/, ""))
-      .filter(validPublicUrl);
-  }
-
-  function dedupe(values) {
-    return [...new Set(values)];
-  }
-
-  function storageGet() {
-    return new Promise((resolve) => {
-      chrome.storage.local.get([STORAGE_KEY], (result) => {
-        const saved = result[STORAGE_KEY] || {};
-        resolve({
-          ...DEFAULT_STATE,
-          ...saved,
-          history: saved.history || {},
-          log: Array.isArray(saved.log) ? saved.log : [],
-          runs: Array.isArray(saved.runs) ? saved.runs : []
-        });
+  function storageGetRaw(keys) {
+    return new Promise((resolve, reject) => {
+      chrome.storage.local.get(keys, (result) => {
+        const error = chrome.runtime.lastError;
+        if (error) reject(new Error(error.message));
+        else resolve(result || {});
       });
     });
   }
 
-  function storageSet() {
-    return new Promise((resolve) => {
-      chrome.storage.local.set({ [STORAGE_KEY]: state }, resolve);
+  function storageSetRaw(payload) {
+    return new Promise((resolve, reject) => {
+      chrome.storage.local.set(payload, () => {
+        const error = chrome.runtime.lastError;
+        if (error) reject(new Error(error.message));
+        else resolve();
+      });
     });
   }
 
-  async function patchState(patch) {
+  function storageRemoveRaw(keys) {
+    return new Promise((resolve, reject) => {
+      chrome.storage.local.remove(keys, () => {
+        const error = chrome.runtime.lastError;
+        if (error) reject(new Error(error.message));
+        else resolve();
+      });
+    });
+  }
+
+  /**
+   * Write to Chrome storage and report a failure in the panel.
+   *
+   * The function never throws. A storage failure must not stop a batch that
+   * is already running, but the user must see that the log is incomplete.
+   */
+  async function writeStorage(payload) {
+    try {
+      await storageSetRaw(payload);
+      if (storageError) {
+        storageError = null;
+        render();
+      }
+      return true;
+    } catch (error) {
+      storageError = error.message || "Chrome could not save the data.";
+      console.error("GSC Indexing Helper: storage write failed.", error);
+      render();
+      return false;
+    }
+  }
+
+  const saveCore = () => writeStorage({ [CORE_KEY]: state });
+  const saveHistory = () => writeStorage({ [HISTORY_KEY]: history });
+
+  function runKey(runId) {
+    return `${RUN_KEY_PREFIX}${runId}`;
+  }
+
+  /** Write one run record with its items. Other runs are not touched. */
+  function saveRun(runId) {
+    const summary = findRunSummary(runId);
+    if (!summary) return Promise.resolve(false);
+    return writeStorage({
+      [runKey(runId)]: { ...summary, items: runItems.get(runId) || [] }
+    });
+  }
+
+  function findRunSummary(runId) {
+    return (state.runIndex || []).find((run) => run.id === runId) || null;
+  }
+
+  async function patchCore(patch) {
     state = { ...state, ...patch };
-    await storageSet();
+    await saveCore();
     render();
   }
 
+  // ---------------------------------------------------------------------------
+  // Log and attempt history
+  // ---------------------------------------------------------------------------
+
+  /**
+   * Add a line to the recent-activity list.
+   *
+   * The attempt history only records an outcome that belongs to the URL. A
+   * quota stop or a CAPTCHA is a problem with the session, so it must not
+   * make the extension skip that URL on the next run.
+   */
   async function addLog(status, url, message) {
     const entry = {
       at: new Date().toISOString(),
@@ -104,69 +182,77 @@
       message: message || ""
     };
     state.log = [entry, ...(state.log || [])].slice(0, 100);
-    if (url && ["success", "already_indexed", "failed", "quota", "blocked"].includes(status)) {
-      state.history = {
-        ...(state.history || {}),
-        [url]: { status, at: entry.at, message: entry.message }
-      };
+    await saveCore();
+
+    if (url && ["success", "already_indexed", "failed"].includes(status)) {
+      history = { ...history, [url]: { status, at: entry.at, message: entry.message } };
+      await saveHistory();
     }
-    await storageSet();
     render();
   }
+
+  // ---------------------------------------------------------------------------
+  // Run records
+  // ---------------------------------------------------------------------------
 
   function newRunId() {
     if (crypto.randomUUID) return crypto.randomUUID();
     return `run-${Date.now()}-${Math.random().toString(16).slice(2)}`;
   }
 
-  function activeRun() {
-    return (state.runs || []).find((run) => run.id === state.activeRunId) || null;
+  function summaryOf(run) {
+    return {
+      id: run.id,
+      reportName: run.reportName,
+      reportUrl: run.reportUrl,
+      requestLimit: run.requestLimit,
+      status: run.status,
+      startedAt: run.startedAt,
+      finishedAt: run.finishedAt,
+      checkedCount: run.checkedCount || 0,
+      requestsSubmitted: run.requestsSubmitted || 0,
+      counts: L.countRunItems(run.items || [])
+    };
   }
 
   async function updateActiveRun(patch) {
-    const runs = [...(state.runs || [])];
-    const index = runs.findIndex((run) => run.id === state.activeRunId);
+    const index = (state.runIndex || []).findIndex((run) => run.id === state.activeRunId);
     if (index < 0) return;
-    runs[index] = { ...runs[index], ...patch };
-    state.runs = runs;
-    await storageSet();
+    const runIndex = [...state.runIndex];
+    runIndex[index] = {
+      ...runIndex[index],
+      ...patch,
+      counts: L.countRunItems(runItems.get(state.activeRunId) || [])
+    };
+    state.runIndex = runIndex;
+    await saveCore();
+    await saveRun(state.activeRunId);
     render();
   }
 
   async function updateRunItem(url, status, message = "") {
-    const runs = [...(state.runs || [])];
-    const runIndex = runs.findIndex((run) => run.id === state.activeRunId);
-    if (runIndex < 0) return;
+    const runId = state.activeRunId;
+    if (!runId || !findRunSummary(runId)) return;
 
-    const run = { ...runs[runIndex] };
-    const items = [...(run.items || [])];
+    const items = [...(runItems.get(runId) || [])];
     let itemIndex = items.findIndex((item) => item.url === url);
     if (itemIndex < 0) {
-      items.push({
-        url,
-        status: "queued",
-        message: "",
-        startedAt: null,
-        finishedAt: null,
-        attempts: []
-      });
+      items.push({ url, status: "queued", message: "", startedAt: null, finishedAt: null, attempts: [] });
       itemIndex = items.length - 1;
     }
 
     const now = new Date().toISOString();
     const existing = items[itemIndex];
     const attempts = [...(existing.attempts || [])];
+
     if (status === "working") {
       attempts.push({ status, message, startedAt: now, finishedAt: null });
-    } else if (["success", "already_indexed", "failed", "cancelled"].includes(status)) {
-      const openAttemptIndex = attempts.findLastIndex((attempt) => attempt.status === "working" && !attempt.finishedAt);
-      const attemptStartedAt = openAttemptIndex >= 0 ? attempts[openAttemptIndex].startedAt : now;
-      const completedAttempt = { status, message, startedAt: attemptStartedAt, finishedAt: now };
-      if (openAttemptIndex >= 0) {
-        attempts[openAttemptIndex] = { ...attempts[openAttemptIndex], ...completedAttempt };
-      } else {
-        attempts.push(completedAttempt);
-      }
+    } else if (L.TERMINAL_STATUSES.includes(status)) {
+      const openIndex = attempts.findLastIndex((attempt) => attempt.status === "working" && !attempt.finishedAt);
+      const startedAt = openIndex >= 0 ? attempts[openIndex].startedAt : now;
+      const finished = { status, message, startedAt, finishedAt: now };
+      if (openIndex >= 0) attempts[openIndex] = { ...attempts[openIndex], ...finished };
+      else attempts.push(finished);
     }
 
     items[itemIndex] = {
@@ -174,57 +260,86 @@
       status,
       message,
       startedAt: existing.startedAt || (status === "working" ? now : null),
-      finishedAt: ["success", "already_indexed", "failed", "cancelled"].includes(status) ? now : null,
+      finishedAt: L.TERMINAL_STATUSES.includes(status) ? now : null,
       attempts
     };
-    run.items = items;
-    runs[runIndex] = run;
-    state.runs = runs;
-    await storageSet();
-    render();
+
+    runItems.set(runId, items);
+    await updateActiveRun({});
   }
 
   async function cancelUnfinishedRunItems() {
-    const run = activeRun();
-    if (!run) return;
+    const runId = state.activeRunId;
+    if (!runId || !findRunSummary(runId)) return;
+
     const now = new Date().toISOString();
-    const items = (run.items || []).map((item) => {
+    const items = (runItems.get(runId) || []).map((item) => {
       if (!["queued", "working"].includes(item.status)) return item;
       const attempts = [...(item.attempts || [])];
-      const openAttemptIndex = attempts.findLastIndex((attempt) => attempt.status === "working" && !attempt.finishedAt);
-      if (openAttemptIndex >= 0) {
-        attempts[openAttemptIndex] = {
-          ...attempts[openAttemptIndex],
+      const openIndex = attempts.findLastIndex((attempt) => attempt.status === "working" && !attempt.finishedAt);
+      if (openIndex >= 0) {
+        attempts[openIndex] = {
+          ...attempts[openIndex],
           status: "cancelled",
           message: "Queue cleared by user.",
           finishedAt: now
         };
       }
-      return {
-        ...item,
-        status: "cancelled",
-        message: "Queue cleared by user.",
-        finishedAt: now,
-        attempts
-      };
+      return { ...item, status: "cancelled", message: "Queue cleared by user.", finishedAt: now, attempts };
     });
-    await updateActiveRun({ status: "cancelled", finishedAt: now, items });
+
+    runItems.set(runId, items);
+    await updateActiveRun({ status: "cancelled", finishedAt: now });
   }
 
-  function attemptedRecently(url) {
-    const item = state.history?.[url];
-    if (!item?.at || !["success", "already_indexed"].includes(item.status)) return false;
-    const age = Date.now() - new Date(item.at).getTime();
-    return age < RETRY_AFTER_DAYS * 24 * 60 * 60 * 1000;
+  /** Keep the newest runs and delete the storage keys of the older runs. */
+  async function pruneStoredRuns() {
+    const { kept, dropped } = L.pruneRunIndex(state.runIndex || [], MAX_RUNS);
+    if (!dropped.length) return;
+    state.runIndex = kept;
+    for (const id of dropped) runItems.delete(id);
+    await saveCore();
+    try {
+      await storageRemoveRaw(dropped.map(runKey));
+    } catch (error) {
+      console.error("GSC Indexing Helper: could not remove old runs.", error);
+    }
   }
+
+  // ---------------------------------------------------------------------------
+  // Page reading
+  // ---------------------------------------------------------------------------
+
+  // `innerText` makes the browser measure the page layout. Search Console is a
+  // large application, so the result is cached for a short time. One poll tick
+  // then reads the page once instead of three or four times.
+  let pageTextCache = { text: "", lower: "", at: 0 };
 
   function pageText() {
-    return normalize(document.body?.innerText || "");
+    const now = Date.now();
+    if (now - pageTextCache.at < PAGE_TEXT_TTL_MS) return pageTextCache.text;
+    const text = normalize(document.body ? document.body.innerText : "");
+    pageTextCache = { text, lower: text.toLowerCase(), at: now };
+    return text;
+  }
+
+  function pageTextLower() {
+    pageText();
+    return pageTextCache.lower;
+  }
+
+  function visible(element) {
+    if (!(element instanceof Element)) return false;
+    // Test the box first. Most elements fail here, which avoids the more
+    // expensive style lookup below.
+    const rect = element.getBoundingClientRect();
+    if (rect.width <= 0 || rect.height <= 0) return false;
+    const style = getComputedStyle(element);
+    return style.display !== "none" && style.visibility !== "hidden";
   }
 
   function currentReportName() {
-    const text = lower(pageText());
-    return REPORT_NAMES.find((name) => text.includes(lower(name))) || null;
+    return L.matchReportName(pageText());
   }
 
   function onTargetReport() {
@@ -233,31 +348,40 @@
 
   function extractReportUrls() {
     const urls = [];
-    const rowSelectors = [
-      "table tr",
-      "[role='row']",
-      "[role='gridcell']",
-      "[role='cell']"
-    ];
+    const rowSelectors = ["table tr", "[role='row']", "[role='gridcell']", "[role='cell']"];
 
     for (const element of document.querySelectorAll(rowSelectors.join(","))) {
       if (!visible(element)) continue;
-      urls.push(...urlsFromText(element.innerText || element.textContent || ""));
+      urls.push(...L.urlsFromText(element.innerText || element.textContent || ""));
       for (const anchor of element.querySelectorAll("a[href]")) {
         const href = anchor.getAttribute("href");
-        if (validPublicUrl(href)) urls.push(href);
-        urls.push(...urlsFromText(anchor.innerText || ""));
+        if (L.validPublicUrl(href)) urls.push(href);
+        urls.push(...L.urlsFromText(anchor.innerText || ""));
       }
     }
 
     if (!urls.length) {
       for (const element of document.querySelectorAll("a, button, [role='button']")) {
         if (!visible(element)) continue;
-        urls.push(...urlsFromText(element.innerText || element.textContent || ""));
+        urls.push(...L.urlsFromText(element.innerText || element.textContent || ""));
       }
     }
 
-    return dedupe(urls);
+    return L.dedupe(urls);
+  }
+
+  // The full row scan is expensive. The panel only needs an approximate count,
+  // so the result is cached. The scan never runs during a batch.
+  let urlCountCache = { href: "", count: 0, at: 0 };
+
+  function visibleUrlCount() {
+    const now = Date.now();
+    const samePage = urlCountCache.href === location.href;
+    const stale = !samePage || now - urlCountCache.at > URL_COUNT_TTL_MS;
+    if (stale && !state.running) {
+      urlCountCache = { href: location.href, count: extractReportUrls().length, at: now };
+    }
+    return urlCountCache.href === location.href ? urlCountCache.count : null;
   }
 
   function allActionElements() {
@@ -269,11 +393,20 @@
     return allActionElements().find((element) => wanted.includes(lower(element.innerText || element.textContent)));
   }
 
+  /**
+   * Return true when a visible element's own text equals one of the names.
+   *
+   * The cheap page-text test runs first. The expensive element scan runs only
+   * when the phrase is somewhere on the page.
+   */
   function hasExactVisibleText(names) {
     const wanted = names.map(lower);
+    const text = pageTextLower();
+    if (!wanted.some((name) => text.includes(name))) return false;
+
     const selectors = "h1, h2, h3, h4, [role='heading'], [role='status'], [role='alert'], div, span";
     return [...document.querySelectorAll(selectors)].some((element) =>
-      visible(element) && wanted.includes(lower(element.innerText || element.textContent))
+      wanted.includes(lower(element.innerText || element.textContent)) && visible(element)
     );
   }
 
@@ -307,16 +440,16 @@
     if (input.isContentEditable) {
       input.textContent = value;
       input.dispatchEvent(new InputEvent("input", { bubbles: true, inputType: "insertText", data: value }));
-    } else {
-      const prototype = input instanceof HTMLTextAreaElement
-        ? HTMLTextAreaElement.prototype
-        : HTMLInputElement.prototype;
-      const setter = Object.getOwnPropertyDescriptor(prototype, "value")?.set;
-      if (setter) setter.call(input, value);
-      else input.value = value;
-      input.dispatchEvent(new Event("input", { bubbles: true }));
-      input.dispatchEvent(new Event("change", { bubbles: true }));
+      return;
     }
+    const prototype = input instanceof HTMLTextAreaElement
+      ? HTMLTextAreaElement.prototype
+      : HTMLInputElement.prototype;
+    const setter = Object.getOwnPropertyDescriptor(prototype, "value")?.set;
+    if (setter) setter.call(input, value);
+    else input.value = value;
+    input.dispatchEvent(new Event("input", { bubbles: true }));
+    input.dispatchEvent(new Event("change", { bubbles: true }));
   }
 
   function pressEnter(input) {
@@ -343,47 +476,12 @@
     throw new Error(`Timed out waiting for ${label}`);
   }
 
-  function blockerMessage() {
-    const text = lower(pageText());
-    const blockers = [
-      ["quota exceeded", "Google's indexing-request quota was reached."],
-      ["verify you are human", "Google asked for human verification."],
-      ["unusual traffic", "Google detected unusual traffic."],
-      ["captcha", "Google displayed a CAPTCHA."],
-      ["url is not in property", "This URL does not belong to the open Search Console property."],
-      ["you don't have permission", "This Google account does not have permission for the URL."],
-      ["couldn't submit indexing request", "Google could not submit the indexing request."],
-      ["could not submit indexing request", "Google could not submit the indexing request."],
-      ["something went wrong", "Google reported that something went wrong."]
-    ];
-    const match = blockers.find(([needle]) => text.includes(needle));
-    return match?.[1] || null;
-  }
-
-  function successMessage() {
-    const text = lower(pageText());
-    const successPhrases = [
-      "indexing requested",
-      "url was added to a priority crawl queue",
-      "request submitted"
-    ];
-    return successPhrases.some((phrase) => text.includes(phrase))
-      ? "Indexing request accepted by Google."
-      : null;
-  }
-
-  function inspectionBusy() {
-    const text = lower(pageText());
-    return [
-      "retrieving data from google index",
-      "inspecting url",
-      "testing if live url can be indexed",
-      "testing whether live url can be indexed"
-    ].some((phrase) => text.includes(phrase));
-  }
+  // ---------------------------------------------------------------------------
+  // The indexing workflow
+  // ---------------------------------------------------------------------------
 
   async function openInspection(url) {
-    // Prefer the report's own URL -> INSPECT flow when the row is still available.
+    // Prefer the report's own URL -> INSPECT flow when the row is available.
     const rowAction = findExactUrlAction(url);
     if (rowAction && onTargetReport()) {
       rowAction.click();
@@ -401,7 +499,7 @@
       }
     }
 
-    // Fallback: the inspection box is present at the top of every GSC screen.
+    // Fallback: the inspection box is present at the top of every screen.
     const input = await waitFor(findInspectionInput, 15000, "the URL inspection box");
     setNativeValue(input, url);
     await sleep(250);
@@ -411,9 +509,9 @@
 
   async function waitForInspectionResult() {
     return waitFor(() => {
-      if (inspectionBusy()) return null;
-      const blocked = blockerMessage();
-      if (blocked) return { type: "blocked", message: blocked };
+      if (L.isInspectionBusy(pageText())) return null;
+      const blocked = L.classifyBlocker(pageText());
+      if (blocked) return { type: "blocked", message: blocked.message, hard: blocked.hard };
       if (hasExactVisibleText(["URL is on Google"])) {
         return { type: "already_indexed", message: "URL is already on Google; no indexing request was submitted." };
       }
@@ -423,17 +521,47 @@
     }, 180000, "Google's URL inspection result");
   }
 
+  /**
+   * Remove a confirmation message that belongs to the previous URL.
+   *
+   * Google leaves the confirmation on the page while it fades out. The
+   * function clicks the dismiss button and then waits for the text to go.
+   * A clean page makes the next confirmation unambiguous.
+   */
+  async function dismissLingeringSuccess() {
+    pageTextCache.at = 0;
+    if (!L.findNewSuccess(pageText(), "")) return;
+
+    const dismiss = exactAction(["GOT IT", "OK", "DISMISS", "CLOSE"]);
+    if (dismiss) dismiss.click();
+
+    const started = Date.now();
+    while (Date.now() - started < 10000) {
+      await sleep(500);
+      pageTextCache.at = 0;
+      if (!L.findNewSuccess(pageText(), "")) return;
+    }
+  }
+
   async function requestIndexing(button) {
     if (!button || !visible(button) || !actionEnabled(button)) {
       throw new Error("Request indexing button disappeared or became unavailable");
     }
+
+    await dismissLingeringSuccess();
+
+    // Record the page text before the click. The extension accepts a
+    // confirmation only when the text was not already present. This stops an
+    // old message from counting as a new success.
+    pageTextCache.at = 0;
+    const textBeforeClick = pageText();
     button.click();
 
     const outcome = await waitFor(() => {
-      const success = successMessage();
+      const success = L.findNewSuccess(pageText(), textBeforeClick);
       if (success) return { type: "success", message: success };
-      const blocked = blockerMessage();
-      if (blocked) return { type: "blocked", message: blocked };
+      const blocked = L.classifyBlocker(pageText());
+      if (blocked) return { type: "blocked", message: blocked.message, hard: blocked.hard };
       return null;
     }, 240000, "Google's indexing confirmation");
 
@@ -443,7 +571,7 @@
   }
 
   async function processOne(url) {
-    await patchState({ activeUrl: url });
+    await patchCore({ activeUrl: url });
     await updateRunItem(url, "working", "Opening URL inspection.");
     await addLog("working", url, "Opening URL inspection.");
     await openInspection(url);
@@ -453,6 +581,72 @@
 
     await addLog("working", url, "Inspection loaded; requesting indexing.");
     return requestIndexing(result.button);
+  }
+
+  async function recordSuccess(url, message) {
+    await updateRunItem(url, "success", message);
+    state.queue = state.queue.slice(1);
+    state.checkedThisRun += 1;
+    state.requestsThisRun += 1;
+    state.consecutiveFailures = 0;
+    state.activeUrl = null;
+    await addLog("success", url, message);
+    await updateActiveRun({
+      checkedCount: state.checkedThisRun,
+      requestsSubmitted: state.requestsThisRun
+    });
+  }
+
+  async function recordAlreadyIndexed(url, message) {
+    await updateRunItem(url, "already_indexed", message);
+    state.queue = state.queue.slice(1);
+    state.checkedThisRun += 1;
+    state.consecutiveFailures = 0;
+    state.activeUrl = null;
+    await addLog("already_indexed", url, message);
+    await updateActiveRun({
+      checkedCount: state.checkedThisRun,
+      requestsSubmitted: state.requestsThisRun
+    });
+  }
+
+  /**
+   * Record a problem with one URL and move on.
+   *
+   * The failure goes into the attempt history. The extension then skips that
+   * URL for three days. This stops one broken URL from blocking every later
+   * run, because the report shows the same URL first each day.
+   */
+  async function recordSoftFailure(url, message) {
+    await updateRunItem(url, "failed", message);
+    state.queue = state.queue.slice(1);
+    state.checkedThisRun += 1;
+    state.consecutiveFailures += 1;
+    state.activeUrl = null;
+    await addLog("failed", url, message);
+    await updateActiveRun({
+      checkedCount: state.checkedThisRun,
+      requestsSubmitted: state.requestsThisRun
+    });
+  }
+
+  /**
+   * Stop the whole run.
+   *
+   * The URL stays at the front of the queue so that Resume tries it again.
+   * The attempt history is not changed, because the account or the browser
+   * session caused the problem, not the URL.
+   */
+  async function recordHardStop(url, message, quota) {
+    await updateRunItem(url, "failed", message);
+    state.checkedThisRun += 1;
+    await addLog(quota ? "quota" : "blocked", url, message);
+    await updateActiveRun({
+      status: quota ? "stopped: quota" : "stopped: blocked",
+      checkedCount: state.checkedThisRun,
+      requestsSubmitted: state.requestsThisRun
+    });
+    await patchCore({ running: false, paused: true, activeUrl: null });
   }
 
   async function runWorker() {
@@ -466,79 +660,67 @@
         state.requestsThisRun < state.runLimit
       ) {
         const url = state.queue[0];
+        let outcome;
+
         try {
-          const outcome = await processOne(url);
-          if (outcome.type === "already_indexed") {
-            await updateRunItem(url, "already_indexed", outcome.message);
-            state.queue = state.queue.slice(1);
-            state.checkedThisRun += 1;
-            state.activeUrl = null;
-            await addLog("already_indexed", url, outcome.message);
-            await updateActiveRun({
-              checkedCount: state.checkedThisRun,
-              requestsSubmitted: state.requestsThisRun
-            });
-            await storageSet();
-            render();
-            await sleep(750);
-            continue;
-          }
-
-          if (outcome.type === "success") {
-            await updateRunItem(url, "success", outcome.message);
-            state.queue = state.queue.slice(1);
-            state.checkedThisRun += 1;
-            state.requestsThisRun += 1;
-            state.completedThisRun = state.requestsThisRun;
-            state.activeUrl = null;
-            await addLog("success", url, outcome.message);
-            await updateActiveRun({
-              checkedCount: state.checkedThisRun,
-              requestsSubmitted: state.requestsThisRun
-            });
-            await storageSet();
-            render();
-            await sleep(1500);
-            continue;
-          }
-
-          const quota = /quota/i.test(outcome.message);
-          state.checkedThisRun += 1;
-          await updateRunItem(url, "failed", outcome.message);
-          await addLog(quota ? "quota" : "blocked", url, outcome.message);
-          await updateActiveRun({
-            status: quota ? "stopped: quota" : "stopped: error",
-            checkedCount: state.checkedThisRun,
-            requestsSubmitted: state.requestsThisRun
-          });
-          await patchState({ running: false, paused: true, activeUrl: null });
-          break;
+          outcome = await processOne(url);
         } catch (error) {
           if (error.message === "PAUSED") break;
-          state.checkedThisRun += 1;
-          await updateRunItem(url, "failed", error.message || "Unexpected extension error.");
-          await addLog("failed", url, error.message || "Unexpected extension error.");
-          await updateActiveRun({
-            status: "stopped: error",
-            checkedCount: state.checkedThisRun,
-            requestsSubmitted: state.requestsThisRun
-          });
-          await patchState({ running: false, paused: true, activeUrl: null });
+          // A timeout or an unexpected error affects this URL only.
+          outcome = {
+            type: "blocked",
+            hard: false,
+            message: error.message || "Unexpected extension error."
+          };
+        }
+
+        if (outcome.type === "already_indexed") {
+          await recordAlreadyIndexed(url, outcome.message);
+          await sleep(750);
+          continue;
+        }
+
+        if (outcome.type === "success") {
+          await recordSuccess(url, outcome.message);
+          await sleep(1500);
+          continue;
+        }
+
+        const quota = /quota/i.test(outcome.message);
+        if (outcome.hard) {
+          await recordHardStop(url, outcome.message, quota);
           break;
         }
+
+        await recordSoftFailure(url, outcome.message);
+
+        if (state.consecutiveFailures >= MAX_CONSECUTIVE_FAILURES) {
+          await updateActiveRun({
+            status: "stopped: repeated failures",
+            finishedAt: new Date().toISOString()
+          });
+          await addLog(
+            "blocked",
+            null,
+            `Stopped after ${MAX_CONSECUTIVE_FAILURES} failures in a row. Check Search Console yourself.`
+          );
+          await patchCore({ running: false, paused: true, activeUrl: null });
+          break;
+        }
+
+        await sleep(1000);
       }
 
       const requestLimitReached = state.requestsThisRun >= state.runLimit;
       const candidatesExhausted = !state.queue.length;
       if (state.running && (requestLimitReached || candidatesExhausted)) {
-        const finishedAt = new Date().toISOString();
         await updateActiveRun({
           status: requestLimitReached ? "completed" : "completed: candidates exhausted",
-          finishedAt,
+          finishedAt: new Date().toISOString(),
           checkedCount: state.checkedThisRun,
           requestsSubmitted: state.requestsThisRun
         });
-        await patchState({ running: false, paused: false, queue: [], activeUrl: null });
+        await patchCore({ running: false, paused: false, queue: [], activeUrl: null });
         await addLog(
           "done",
           null,
@@ -553,18 +735,27 @@
     return workerPromise;
   }
 
+  // ---------------------------------------------------------------------------
+  // Panel actions
+  // ---------------------------------------------------------------------------
+
   async function startBatch(limit = BATCH_LIMIT) {
     const reportName = currentReportName();
     if (!reportName) {
-      await addLog("failed", null, `Open either “${REPORT_NAMES[0]}” or “${REPORT_NAMES[1]}” first.`);
+      await addLog("failed", null, `Open either "${REPORT_NAMES[0]}" or "${REPORT_NAMES[1]}" first.`);
       return;
     }
 
+    const now = Date.now();
     const found = extractReportUrls();
-    const eligible = found.filter((url) => !attemptedRecently(url));
+    urlCountCache = { href: location.href, count: found.length, at: now };
+
+    const eligible = found.filter((url) => !L.skipReason(history, url, now));
+    const skipped = found.length - eligible.length;
+
     if (!eligible.length) {
       const explanation = found.length
-        ? `The visible URLs were already attempted within ${RETRY_AFTER_DAYS} days.`
+        ? `All ${found.length} visible URLs were attempted recently. A successful URL waits ${RETRY_AFTER_DAYS} days and a failed URL waits ${FAILED_RETRY_AFTER_DAYS} days.`
         : "No full URLs were found in the visible report rows.";
       await addLog("failed", null, explanation);
       return;
@@ -572,7 +763,7 @@
 
     const startedAt = new Date().toISOString();
     const runId = newRunId();
-    const run = {
+    const summary = {
       id: runId,
       reportName,
       reportUrl: location.href,
@@ -582,41 +773,50 @@
       status: "running",
       startedAt,
       finishedAt: null,
-      items: []
+      counts: { success: 0, indexed: 0, failed: 0, pending: 0 }
     };
 
-    await patchState({
+    runItems.set(runId, []);
+    history = L.pruneHistory(history, now);
+    await saveHistory();
+
+    await patchCore({
       running: true,
       paused: false,
       queue: eligible,
       activeUrl: null,
-      completedThisRun: 0,
       checkedThisRun: 0,
       requestsThisRun: 0,
+      skippedThisRun: skipped,
+      consecutiveFailures: 0,
       runLimit: limit,
       startedAt,
       reportUrl: location.href,
       activeRunId: runId,
-      runs: [run, ...(state.runs || [])]
+      runIndex: [summary, ...(state.runIndex || [])]
     });
+
+    await saveRun(runId);
+    await pruneStoredRuns();
+
     await addLog(
       "started",
       null,
-      `Found ${eligible.length} candidate URL${eligible.length === 1 ? "" : "s"}; stopping after ${limit} actual indexing request${limit === 1 ? "" : "s"}.`
+      `Found ${eligible.length} candidate URL${eligible.length === 1 ? "" : "s"}${skipped ? ` (${skipped} skipped)` : ""}; stopping after ${limit} accepted request${limit === 1 ? "" : "s"}.`
     );
     runWorker();
   }
 
   async function togglePause() {
     if (state.running && !state.paused) {
-      await patchState({ paused: true, running: false });
+      await patchCore({ paused: true, running: false });
       await updateActiveRun({ status: "paused" });
       await addLog("paused", state.activeUrl, "Paused by user.");
       return;
     }
 
     if (state.queue.length) {
-      await patchState({ paused: false, running: true });
+      await patchCore({ paused: false, running: true, consecutiveFailures: 0 });
       await updateActiveRun({ status: "running" });
       await addLog("started", state.activeUrl, "Resumed queue.");
       runWorker();
@@ -625,14 +825,15 @@
 
   async function clearQueue() {
     await cancelUnfinishedRunItems();
-    await patchState({
+    await patchCore({
       running: false,
       paused: false,
       queue: [],
       activeUrl: null,
-      completedThisRun: 0,
       checkedThisRun: 0,
       requestsThisRun: 0,
+      skippedThisRun: 0,
+      consecutiveFailures: 0,
       runLimit: BATCH_LIMIT,
       startedAt: null,
       activeRunId: null
@@ -640,86 +841,27 @@
     await addLog("cleared", null, "Queue cleared. Attempt history was kept.");
   }
 
-  function statusLabel() {
-    if (state.running) return `Working · ${state.requestsThisRun}/${state.runLimit} requests · ${state.checkedThisRun} checked`;
-    if (state.paused && state.queue.length) return `Paused · ${state.requestsThisRun}/${state.runLimit} requests`;
-    if (state.checkedThisRun) return `Last run · ${state.requestsThisRun} requests · ${state.checkedThisRun} checked`;
-    return "Ready";
-  }
+  /** Read every stored run and download the complete log as CSV. */
+  async function exportRunLog() {
+    const index = state.runIndex || [];
+    if (!index.length) return;
 
-  function escapeHtml(value) {
-    return String(value || "")
-      .replaceAll("&", "&amp;")
-      .replaceAll("<", "&lt;")
-      .replaceAll(">", "&gt;")
-      .replaceAll('"', "&quot;")
-      .replaceAll("'", "&#039;");
-  }
-
-  function formatDate(value) {
-    if (!value) return "";
-    const date = new Date(value);
-    return Number.isNaN(date.getTime()) ? value : date.toLocaleString();
-  }
-
-  function runCounts(run) {
-    const items = run.items || [];
-    const attempts = items.flatMap((item) => item.attempts || []);
-    return {
-      success: attempts.filter((attempt) => attempt.status === "success").length,
-      indexed: attempts.filter((attempt) => attempt.status === "already_indexed").length,
-      failed: attempts.filter((attempt) => attempt.status === "failed").length,
-      pending: items.filter((item) => ["queued", "working"].includes(item.status)).length
-    };
-  }
-
-  function csvCell(value) {
-    return `"${String(value ?? "").replaceAll('"', '""')}"`;
-  }
-
-  function exportRunLog() {
-    const rows = [[
-      "run_id",
-      "run_started_at",
-      "run_finished_at",
-      "report",
-      "run_status",
-      "url",
-      "request_status",
-      "message",
-      "request_started_at",
-      "request_finished_at"
-    ]];
-
-    for (const run of state.runs || []) {
-      for (const item of run.items || []) {
-        const attempts = item.attempts?.length
-          ? item.attempts
-          : [{
-              status: item.status,
-              message: item.message,
-              startedAt: item.startedAt,
-              finishedAt: item.finishedAt
-            }];
-        for (const attempt of attempts) {
-          rows.push([
-            run.id,
-            run.startedAt,
-            run.finishedAt,
-            run.reportName,
-            run.status,
-            item.url,
-            attempt.status,
-            attempt.message,
-            attempt.startedAt,
-            attempt.finishedAt
-          ]);
-        }
-      }
+    let stored = {};
+    try {
+      stored = await storageGetRaw(index.map((run) => runKey(run.id)));
+    } catch (error) {
+      storageError = error.message || "Chrome could not read the run log.";
+      console.error("GSC Indexing Helper: export failed.", error);
+      render();
+      return;
     }
 
-    const csv = rows.map((row) => row.map(csvCell).join(",")).join("\n");
-    const blob = new Blob([csv], { type: "text/csv;charset=utf-8" });
+    const runs = index.map((summary) => {
+      const record = stored[runKey(summary.id)];
+      return { ...summary, items: (record && record.items) || runItems.get(summary.id) || [] };
+    });
+
+    const blob = new Blob([L.buildCsv(runs)], { type: "text/csv;charset=utf-8" });
     const downloadUrl = URL.createObjectURL(blob);
     const link = document.createElement("a");
     link.href = downloadUrl;
@@ -731,39 +873,79 @@
     setTimeout(() => URL.revokeObjectURL(downloadUrl), 1000);
   }
 
-  function render() {
-    if (!ui) return;
-    const recent = (state.log || []).slice(0, 5);
-    const recentRuns = (state.runs || []).slice(0, 5);
+  // ---------------------------------------------------------------------------
+  // Panel
+  // ---------------------------------------------------------------------------
+
+  function statusLabel() {
+    if (state.running) return `Working - ${state.requestsThisRun}/${state.runLimit} requests - ${state.checkedThisRun} checked`;
+    if (state.paused && state.queue.length) return `Paused - ${state.requestsThisRun}/${state.runLimit} requests`;
+    if (state.checkedThisRun) return `Last run - ${state.requestsThisRun} requests - ${state.checkedThisRun} checked`;
+    return "Ready";
+  }
+
+  function formatDate(value) {
+    if (!value) return "";
+    const date = new Date(value);
+    return Number.isNaN(date.getTime()) ? value : date.toLocaleString();
+  }
+
+  function reportBannerHtml() {
     const reportName = currentReportName();
-    const foundCount = onTargetReport() ? extractReportUrls().length : 0;
-    ui.panel.innerHTML = `
+    if (!reportName) {
+      return `<div class="report warn">Open a Crawled or Discovered "currently not indexed" detail report</div>`;
+    }
+    const count = visibleUrlCount();
+    const countText = count === null
+      ? "Report open"
+      : `${count} URL${count === 1 ? "" : "s"} visible`;
+    return `<div class="report ok">${escapeHtml(countText)} in "${escapeHtml(reportName)}"</div>`;
+  }
+
+  function runItemsHtml(runId) {
+    const items = runItems.get(runId);
+    if (!items) return `<div class="run-item"><span>-</span><div>Expand after a reload to load details.</div></div>`;
+    return items.flatMap((item) => {
+      const attempts = (item.attempts && item.attempts.length)
+        ? item.attempts
+        : [{ status: item.status, message: item.message }];
+      return attempts.map((attempt) => `
+        <div class="run-item ${escapeHtml(attempt.status)}">
+          <span>${escapeHtml(attempt.status)}</span>
+          <div title="${escapeHtml(attempt.message || item.url)}">${escapeHtml(item.url)}</div>
+        </div>`);
+    }).join("");
+  }
+
+  function panelHtml() {
+    const recent = (state.log || []).slice(0, 5);
+    const recentRuns = (state.runIndex || []).slice(0, DISPLAYED_RUNS);
+    const busy = state.running || state.queue.length > 0;
+
+    return `
       <div class="head">
         <div>
           <div class="title">GSC Indexing Helper</div>
           <div class="status">${escapeHtml(statusLabel())}</div>
         </div>
-        <button class="icon" data-action="collapse" title="Minimize">−</button>
+        <button class="icon" data-action="collapse" title="Minimize">-</button>
       </div>
       <div class="body">
-        <div class="report ${onTargetReport() ? "ok" : "warn"}">
-          ${onTargetReport()
-            ? `${foundCount} URL${foundCount === 1 ? "" : "s"} visible in “${escapeHtml(reportName)}”`
-            : `Open a Crawled or Discovered “currently not indexed” detail report`}
-        </div>
+        ${storageError ? `<div class="report error">Chrome could not save data: ${escapeHtml(storageError)}. The run log may be incomplete.</div>` : ""}
+        ${reportBannerHtml()}
         ${state.activeUrl ? `<div class="active"><strong>Current</strong><span>${escapeHtml(state.activeUrl)}</span></div>` : ""}
         <div class="buttons">
-          <button data-action="start-one" ${state.running || state.queue.length ? "disabled" : ""}>Submit one</button>
-          <button class="primary" data-action="start" ${state.running || state.queue.length ? "disabled" : ""}>Run first 10</button>
+          <button data-action="start-one" ${busy ? "disabled" : ""}>Submit one</button>
+          <button class="primary" data-action="start" ${busy ? "disabled" : ""}>Run first 10</button>
           <button data-action="pause" ${!state.queue.length ? "disabled" : ""}>${state.running ? "Pause" : "Resume"}</button>
           <button data-action="clear" ${!state.queue.length && !state.activeUrl ? "disabled" : ""}>Clear</button>
         </div>
-        <div class="note">Only a successful Request indexing submission counts toward 10. “URL is on Google” counts as 0 and moves on. Set the report to show 25–50 rows so there are enough candidates. Stops on quota, verification, permission errors, or an unexpected screen.</div>
+        <div class="note">Only an accepted Request indexing submission counts toward 10. "URL is on Google" counts as 0 and moves on. A failed URL is skipped and the run continues. The run stops on a quota message, a CAPTCHA, or ${MAX_CONSECUTIVE_FAILURES} failures in a row. Set the report to show 25-50 rows.</div>
         <div class="log">
           ${recent.length ? recent.map((item) => `
             <div class="log-row ${escapeHtml(item.status)}">
               <span>${escapeHtml(item.status)}</span>
-              <div title="${escapeHtml(item.url || item.message)}">${escapeHtml(item.url || item.message)}</div>
+              <div title="${escapeHtml(item.message || item.url)}">${escapeHtml(item.url || item.message)}</div>
             </div>`).join("") : `<div class="empty">No activity yet.</div>`}
         </div>
         <div class="history-head">
@@ -772,26 +954,29 @@
         </div>
         <div class="runs">
           ${recentRuns.length ? recentRuns.map((run) => {
-            const counts = runCounts(run);
+            const counts = run.counts || { success: 0, indexed: 0, failed: 0, pending: 0 };
             return `
-              <details class="run">
+              <details class="run" data-run-id="${escapeHtml(run.id)}" ${openRunIds.has(run.id) ? "open" : ""}>
                 <summary>
                   <span>${escapeHtml(formatDate(run.startedAt))}</span>
-                  <span class="counts">${counts.success} requested · ${counts.indexed} indexed · ${counts.failed} failed${counts.pending ? ` · ${counts.pending} pending` : ""}</span>
+                  <span class="counts">${counts.success} requested - ${counts.indexed} indexed - ${counts.failed} failed${counts.pending ? ` - ${counts.pending} pending` : ""}</span>
                 </summary>
-                <div class="run-meta">${escapeHtml(run.reportName)} · ${escapeHtml(run.status)}</div>
-                ${(run.items || []).flatMap((item) => {
-                  const attempts = item.attempts?.length ? item.attempts : [{ status: item.status, message: item.message }];
-                  return attempts.map((attempt) => `
-                    <div class="run-item ${escapeHtml(attempt.status)}">
-                      <span>${escapeHtml(attempt.status)}</span>
-                      <div title="${escapeHtml(attempt.message || item.url)}">${escapeHtml(item.url)}</div>
-                    </div>`);
-                }).join("")}
+                <div class="run-meta">${escapeHtml(run.reportName)} - ${escapeHtml(run.status)}</div>
+                ${runItemsHtml(run.id)}
               </details>`;
           }).join("") : `<div class="empty">No completed or attempted runs yet.</div>`}
         </div>
       </div>`;
+  }
+
+  function render() {
+    if (!ui) return;
+    const html = panelHtml();
+    // Rebuild the panel only when the markup changed. This keeps the browser
+    // from re-creating the run list every time Search Console changes its DOM.
+    if (html === lastPanelHtml) return;
+    lastPanelHtml = html;
+    ui.panel.innerHTML = html;
   }
 
   function mount() {
@@ -815,6 +1000,7 @@
         .report { margin-bottom: 10px; border-radius: 8px; padding: 8px 10px; }
         .report.ok { background: #e6f4ea; color: #137333; }
         .report.warn { background: #fef7e0; color: #8a4b00; }
+        .report.error { background: #fce8e6; color: #b3261e; }
         .active { display: grid; gap: 3px; margin-bottom: 10px; }
         .active span { overflow: hidden; color: #5f6368; text-overflow: ellipsis; white-space: nowrap; }
         .buttons { display: flex; flex-wrap: wrap; gap: 7px; margin-bottom: 10px; }
@@ -859,29 +1045,125 @@
       if (action === "export") exportRunLog();
       if (action === "collapse") {
         panel.classList.toggle("collapsed");
-        button.textContent = panel.classList.contains("collapsed") ? "+" : "−";
+        button.textContent = panel.classList.contains("collapsed") ? "+" : "-";
       }
     });
+
+    // Remember which runs the user expanded. A render must not close them.
+    // The toggle event does not bubble, so the listener uses the capture phase.
+    shadow.addEventListener("toggle", (event) => {
+      const details = event.target;
+      if (!(details instanceof HTMLDetailsElement)) return;
+      const runId = details.dataset.runId;
+      if (!runId) return;
+      if (details.open) openRunIds.add(runId);
+      else openRunIds.delete(runId);
+    }, true);
+
     render();
   }
 
+  // ---------------------------------------------------------------------------
+  // Start-up
+  // ---------------------------------------------------------------------------
+
+  /**
+   * Move data from the single version 1 record into the split layout.
+   *
+   * Version 1 kept the live state, the history, and every run under one key.
+   * Each small update rewrote the complete log.
+   */
+  async function migrateLegacyState() {
+    const raw = await storageGetRaw([LEGACY_KEY]);
+    const old = raw[LEGACY_KEY];
+    if (!old) return false;
+
+    const oldRuns = Array.isArray(old.runs) ? old.runs : [];
+    const { kept } = L.pruneRunIndex(oldRuns, MAX_RUNS);
+
+    const payload = {};
+    const runIndex = [];
+    for (const run of kept) {
+      if (!run || !run.id) continue;
+      runIndex.push(summaryOf(run));
+      payload[runKey(run.id)] = run;
+    }
+
+    payload[HISTORY_KEY] = L.pruneHistory(old.history || {});
+    payload[CORE_KEY] = {
+      ...DEFAULT_CORE,
+      // Keep a queue that the user paused before the update. The run never
+      // restarts by itself, so `running` stays false.
+      running: false,
+      paused: Array.isArray(old.queue) && old.queue.length > 0,
+      queue: Array.isArray(old.queue) ? old.queue : [],
+      activeRunId: old.activeRunId || null,
+      runLimit: old.runLimit || DEFAULT_CORE.runLimit,
+      checkedThisRun: old.checkedThisRun || 0,
+      requestsThisRun: old.requestsThisRun || 0,
+      startedAt: old.startedAt || null,
+      reportUrl: old.reportUrl || null,
+      log: Array.isArray(old.log) ? old.log.slice(0, 100) : [],
+      runIndex
+    };
+
+    await storageSetRaw(payload);
+    await storageRemoveRaw([LEGACY_KEY]);
+    console.info(`GSC Indexing Helper: moved ${runIndex.length} run(s) to the new storage layout.`);
+    return true;
+  }
+
+  async function loadState() {
+    const raw = await storageGetRaw([CORE_KEY, HISTORY_KEY]);
+    const core = raw[CORE_KEY] || {};
+    state = {
+      ...DEFAULT_CORE,
+      ...core,
+      queue: Array.isArray(core.queue) ? core.queue : [],
+      log: Array.isArray(core.log) ? core.log : [],
+      runIndex: Array.isArray(core.runIndex) ? core.runIndex : []
+    };
+    history = raw[HISTORY_KEY] || {};
+
+    // Load the items for the runs the panel shows. Older runs stay on disk
+    // and are read only when the user exports the CSV.
+    const shown = state.runIndex.slice(0, DISPLAYED_RUNS);
+    if (shown.length) {
+      const stored = await storageGetRaw(shown.map((run) => runKey(run.id)));
+      for (const run of shown) {
+        const record = stored[runKey(run.id)];
+        if (record && Array.isArray(record.items)) runItems.set(run.id, record.items);
+      }
+    }
+  }
+
   async function init() {
-    state = await storageGet();
-    // Never resume a click sequence merely because Chrome reopened a tab.
+    try {
+      await migrateLegacyState();
+      await loadState();
+    } catch (error) {
+      storageError = error.message || "Chrome could not read the stored data.";
+      console.error("GSC Indexing Helper: could not read storage.", error);
+    }
+
+    // Never resume a click sequence only because Chrome reopened a tab.
     if (state.running) {
       state.running = false;
-      state.paused = Boolean(state.queue.length);
-      const runIndex = (state.runs || []).findIndex((run) => run.id === state.activeRunId);
-      if (runIndex >= 0) state.runs[runIndex] = { ...state.runs[runIndex], status: "paused: browser restarted" };
-      await storageSet();
+      state.paused = state.queue.length > 0;
+      const index = state.runIndex.findIndex((run) => run.id === state.activeRunId);
+      if (index >= 0) {
+        state.runIndex[index] = { ...state.runIndex[index], status: "paused: browser restarted" };
+      }
+      await saveCore();
     }
+
     mount();
 
     const observer = new MutationObserver(() => {
-      clearTimeout(observer.renderTimer);
-      observer.renderTimer = setTimeout(render, 400);
+      clearTimeout(renderTimer);
+      renderTimer = setTimeout(render, RENDER_DEBOUNCE_MS);
     });
-    observer.observe(document.body, { childList: true, subtree: true });
+    if (document.body) observer.observe(document.body, { childList: true, subtree: true });
   }
 
   init().catch((error) => console.error("GSC Indexing Helper failed to initialize", error));
