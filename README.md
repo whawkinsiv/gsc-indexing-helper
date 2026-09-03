@@ -8,15 +8,17 @@ A deliberately small Chrome extension that processes up to 10 visible URLs from 
 ## What it does
 
 1. Reads the visible URLs in the open report.
-2. Skips URLs attempted within the previous 14 days.
-3. Opens URL Inspection using the report's own **INSPECT** action when available.
-4. Falls back to the global **Inspect any URL** box if the report action is unavailable.
-5. Clicks **REQUEST INDEXING** and waits for Google's confirmation.
-6. If inspection says **URL is on Google**, records it as already indexed, consumes zero of the 10-request limit, and immediately checks the next URL.
-7. Continues until it has made 10 successful **Request indexing** submissions or runs out of visible report candidates.
-8. Stops rather than continuing if it sees a quota message, human-verification screen, permission problem, unexpected error, or interface it cannot recognize.
-9. Permanently records each run and every checked URL's outcome in Chrome's local extension storage.
-10. Exports the complete run history as a CSV file.
+2. Skips a URL that Google already accepted or already indexed in the previous 14 days.
+3. Skips a URL that failed in the previous 3 days.
+4. Opens URL Inspection using the report's own **INSPECT** action when available.
+5. Falls back to the global **Inspect any URL** box if the report action is unavailable.
+6. Clicks **REQUEST INDEXING** and waits for Google's confirmation.
+7. If inspection says **URL is on Google**, records it as already indexed, consumes zero of the 10-request limit, and immediately checks the next URL.
+8. Continues until it has made 10 accepted **Request indexing** submissions or runs out of visible report candidates.
+9. Records a problem with one URL, then moves to the next URL.
+10. Stops the whole run if it sees a quota message, a human-verification screen, a CAPTCHA, or 3 failures in a row.
+11. Permanently records each run and every checked URL's outcome in Chrome's local extension storage.
+12. Exports the complete run history as a CSV file.
 
 The extension does not bypass CAPTCHA, rotate accounts, evade quotas, call undocumented Google endpoints, or run in the background. Every batch must be started by you while Search Console is open.
 
@@ -32,6 +34,8 @@ The extension does not bypass CAPTCHA, rotate accounts, evade quotas, call undoc
 
 Replace the files inside the same `gsc-indexing-helper` folder you originally loaded, then click **Reload** on the extension's card at `chrome://extensions`. Keeping the same installed folder preserves its stored history.
 
+Version 0.4.0 changes how the extension stores its data. The first run after the update moves your existing history into the new layout. You do not need to do anything.
+
 ## Use
 
 1. Open the relevant property in Google Search Console.
@@ -45,9 +49,21 @@ Replace the files inside the same `gsc-indexing-helper` folder you originally lo
 
 Do not click around in the Search Console tab while a batch is running. You can press **Pause** at any time.
 
+## When the extension stops
+
+The extension separates a problem with one URL from a problem with your session.
+
+**One URL.** Examples are "URL is not in property", "Something went wrong", and a timeout. The extension records the failure, skips that URL for 3 days, and continues with the next URL. The 3-day wait stops one broken URL from blocking every later run, because the report shows the same URL first each day.
+
+**Your session.** Examples are a quota message, a human-verification screen, and a CAPTCHA. The extension stops the whole run and keeps the URL in the queue. The attempt history does not change, because the URL is not at fault. Press **Resume** after you fix the problem.
+
+**Three failures in a row.** The extension stops the run. Open Search Console yourself and check what changed.
+
 ## Run log
 
-The panel shows the five most recent runs. Expand a run to see which URLs were already indexed, which received a successful indexing request, and which failed. Click **Export CSV** to download the complete history. The full log persists across Chrome restarts and extension updates until you uninstall the extension or clear its stored site data.
+The panel shows the five most recent runs. Expand a run to see which URLs were already indexed, which received an accepted indexing request, and which failed. Click **Export CSV** to download the complete history.
+
+The extension keeps the 200 most recent runs. It keeps the attempt history for 90 days. It removes older records to keep Chrome's storage small and fast.
 
 ## What the report status means
 
@@ -62,3 +78,27 @@ The extension uses visible labels rather than Google's generated CSS class names
 ## Privacy
 
 The extension only runs on `https://search.google.com/search-console/*`. Queue state, attempt history, and the permanent run log stay in Chrome's local extension storage. It sends no data to any server.
+
+## Development
+
+The extension needs no build step. Chrome loads the source files directly.
+
+| File | Purpose |
+| --- | --- |
+| `manifest.json` | The Chrome extension manifest. |
+| `lib.js` | Pure rules with no DOM access. Loads before `content.js`. |
+| `content.js` | The panel, the page reading, and the indexing workflow. |
+| `styles.css` | The position of the panel host element. |
+| `tests/lib.test.js` | Unit tests for the rules in `lib.js`. |
+| `tests/extension.test.js` | Tests that load the extension into a simulated Search Console page. |
+
+Install the development tools and run the checks:
+
+```
+npm install
+npm run lint
+npm test
+npm run check
+```
+
+`npm test` needs Node 20 or later. The tests use the built-in Node test runner and jsdom. They do not need Chrome.
